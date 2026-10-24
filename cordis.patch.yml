@@ -1,0 +1,3 @@
+- insert:
+    - id: bkms-plugin-center
+      name: '@bkms/plugin-center'
