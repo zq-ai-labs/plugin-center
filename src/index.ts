@@ -31,6 +31,13 @@ export function apply(ctx: any, config: Config = {}): void {
       return () => { instance.stop(); if (sync === instance) sync = undefined }
     }, 'bkms-plugin-center: auto sync')
   })
+  // 给其他插件（应用中心）用的窄接口：读目录、按目录条目安装、查进度。安装仍走同一套校验与串行队列。
+  if (typeof ctx.provide === 'function') ctx.provide('bkmsPluginCenter', {
+    version: 1,
+    catalog: () => readCatalog(sync?.getConfig().address),
+    install: (url: string) => { if (!sync) throw new Error(unavailable.reason); return sync.install(String(url ?? '')) },
+    status: (since?: number) => sync?.status(Number(since) || 0) ?? unavailable,
+  })
   ctx.inject(['webServer'], (host: any) => {
     type Operation = (url: URL, body: any) => unknown
     const register = (path: string, methods: { GET?: Operation; POST?: Operation }) => host.effect(() => host.webServer.register({ kind: 'exact', path, handler: async (req: any, res: any) => {
