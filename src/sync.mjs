@@ -8,10 +8,12 @@
  * - 单个插件连续失败 maxFailures 次后暂停，直到规则版本变化或用户点击重试；每次失败后间隔 delaySeconds。
  * - 安装由官方 pluginManager 执行；生效动作按目标版本的 restart 设置与官方结果得出（none / reload / restart）。
  * - 插件中心自身最后升级，完成后总是提示重启。forceRemove 与变更通知本版本不执行。
+ * - 离线种子（seed）：随客户端安装包提供的 distribution-v2.json 与 packages/*.tgz。启动时把种子包按 SHA256 放进缓存，
+ *   中心读不到时依次使用上次读到的中心规则、种子规则继续安装，因此断网首次启动也能装好；同版本不再下载。
  */
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { centerAddress, defaultCenter, parseDistribution, prepareArtifact, readCatalog } from './service.mjs';
 
 export const SELF = '@bkms/plugin-center';
@@ -122,14 +124,18 @@ export function staleLinkProblem(profileDir, name) {
  * @param {{set: Function, clear: Function}} [options.timers] 测试可替换的计时器
  * @param {number} [options.startupDelayMs] 启动后首次检查的延迟
  * @param {(level: 'info' | 'warn', message: string) => void} [options.log] 日志输出
+ * @param {string} [options.seed] 离线种子目录（distribution-v2.json 与 packages/*.tgz），随客户端安装包提供
  */
-export function createSync({ manager, home, stateDir, profileDir, preset = {}, fetcher = (...args) => fetch(...args), now = () => Date.now(), timers = { set: setTimeout, clear: clearTimeout }, startupDelayMs = 10000, log = () => {} }) {
+export function createSync({ manager, home, stateDir, profileDir, preset = {}, fetcher = (...args) => fetch(...args), now = () => Date.now(), timers = { set: setTimeout, clear: clearTimeout }, startupDelayMs = 10000, log = () => {}, seed }) {
   const root = join(home, 'bkms-plugin-center');
   const configFile = join(root, 'config.json');
   const cacheDir = join(root, 'packages');
   const stateFile = join(stateDir, 'sync-state.json');
+  // 上次成功读到的中心规则：中心暂时读不到时继续按它维护插件。
+  const policyFile = join(stateDir, 'policy.json');
   let state = { revision: null, lastCheck: null, lastError: '', plugins: {}, history: [], ...readJson(stateFile, {}) };
-  let policy = null, etag = null, policyCenter = null;
+  let policy = null, etag = null, policyCenter = null, policySource = null;
+  let seedPolicy = null, seedError = '', seeded = false;
   let running = null, timer, nextCheckAt = null, disposed = false, backoff = 0, conflict = '';
   let rows = [];
   // 安装进度：packageName → { phase, received, total, detail, source, at, error }；requestId → packageName。
@@ -166,7 +172,43 @@ export function createSync({ manager, home, stateDir, profileDir, preset = {}, f
     policy = parseDistribution(body);
     etag = response.headers.get('etag');
     policyCenter = address;
+    try { writeJson(policyFile, { center: address, policy }); } catch { /* 规则缓存只为离线时使用 */ }
     return policy;
+  }
+
+  /**
+   * 读入离线种子：规则留作中心读不到时使用；种子包按 SHA256 复制进缓存，prepareArtifact 命中缓存就不再下载。
+   * 只执行一次；种子缺失或损坏时记录原因，不影响按中心规则同步。
+   */
+  function loadSeed() {
+    if (seeded || !seed) return;
+    seeded = true;
+    try {
+      const rulesFile = join(seed, 'distribution-v2.json');
+      if (existsSync(rulesFile)) seedPolicy = parseDistribution(JSON.parse(readFileSync(rulesFile, 'utf8')));
+      const packagesDir = join(seed, 'packages');
+      if (existsSync(packagesDir)) {
+        mkdirSync(cacheDir, { recursive: true });
+        for (const file of readdirSync(packagesDir).filter(name => name.endsWith('.tgz'))) {
+          const bytes = readFileSync(join(packagesDir, file));
+          const target = join(cacheDir, createHash('sha256').update(bytes).digest('hex') + '.tgz');
+          if (!existsSync(target)) copyFileSync(join(packagesDir, file), target);
+        }
+      }
+    } catch (error) {
+      seedError = `离线种子不可用：${messageOf(error)}`;
+      log('warn', seedError);
+    }
+  }
+
+  /** 中心读不到时的规则：先用上次读到的中心规则，再用离线种子。 */
+  function fallbackPolicy(address) {
+    if (policy && policyCenter === address) return { policy, source: 'cache' };
+    const cached = readJson(policyFile, null);
+    if (cached?.policy && cached.center === address) {
+      try { return { policy: parseDistribution(cached.policy), source: 'cache' }; } catch { /* 损坏时退到种子 */ }
+    }
+    return seedPolicy ? { policy: seedPolicy, source: 'seed' } : null;
   }
 
   /** bkms-market 的旧自动同步仍开启时，两边会同时修改同一个 Profile，暂停执行。 */
@@ -225,15 +267,22 @@ export function createSync({ manager, home, stateDir, profileDir, preset = {}, f
   async function check(trigger) {
     const { address } = config();
     noticeSeq += 1;
-    let current;
+    loadSeed();
+    let current, centerError = '';
     try {
       current = await fetchPolicy(address);
+      policySource = 'center';
+      backoff = 0;
     } catch (error) {
-      state.lastError = messageOf(error); state.lastCheck = new Date(now()).toISOString(); save();
+      centerError = messageOf(error);
       backoff += 1;
-      return;
+      // 中心读不到时不停下：按上次的中心规则或离线种子继续维护，保证断网首次启动也能装好。
+      const fallback = fallbackPolicy(address);
+      if (!fallback) { state.lastError = centerError; state.lastCheck = new Date(now()).toISOString(); save(); return; }
+      current = fallback.policy;
+      policySource = fallback.source;
+      log('warn', `center unavailable (${centerError}); using ${fallback.source} rules`);
     }
-    backoff = 0;
     const bundles = await manager().listBundles();
     conflict = legacyConflict(bundles);
     if (state.revision !== current.revision) {
@@ -273,7 +322,8 @@ export function createSync({ manager, home, stateDir, profileDir, preset = {}, f
       item.row.failures = entry.failures; item.row.lastError = entry.lastError;
       if (!entry.failures) item.row.installed = item.rule.version;
     }
-    state.lastError = ''; state.lastCheck = new Date(now()).toISOString(); save();
+    state.lastError = centerError ? `${centerError}（已按${policySource === 'seed' ? '离线种子' : '上次的中心规则'}继续）` : '';
+    state.lastCheck = new Date(now()).toISOString(); save();
   }
 
   function run(trigger) {
@@ -364,6 +414,7 @@ export function createSync({ manager, home, stateDir, profileDir, preset = {}, f
       return {
         available: true, autoSync, center: address, centerSource: source, running: !!running, nextCheckAt,
         lastCheck: state.lastCheck, lastError: state.lastError, revision: state.revision, conflict,
+        policySource, seed: seed ? { loaded: !!seedPolicy, error: seedError } : null,
         plugins: rows, history: state.history,
         // 进行中的安装始终返回；完成的保留 20 秒用于显示结果，失败的保留到下次尝试。
         progress: Object.fromEntries([...progress].filter(([, p]) => p.phase !== 'done' || now() - p.at < 20000)),

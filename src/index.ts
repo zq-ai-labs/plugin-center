@@ -3,8 +3,11 @@ import { join } from 'node:path'
 import { readCatalog } from './service.mjs'
 import { createSync } from './sync.mjs'
 
-/** Profile 预置：center 为默认中心地址，autoSync 为默认自动更新开关；设置页保存的值优先。 */
-export interface Config { center?: string; autoSync?: boolean }
+/**
+ * Profile 预置：center 为默认中心地址，autoSync 为默认自动更新开关；设置页保存的值优先。
+ * seed 为随客户端安装包提供的离线种子目录，留空时读环境变量 BKMS_PLUGIN_CENTER_SEED（由桌面端设置）。
+ */
+export interface Config { center?: string; autoSync?: boolean; seed?: string }
 
 type Sync = ReturnType<typeof createSync>
 const unavailable = { available: false, reason: '当前 DSH 未提供插件管理服务，无法自动更新' }
@@ -21,6 +24,7 @@ export function apply(ctx: any, config: Config = {}): void {
       profileDir: profile?.dir,
       preset: { center: config.center, autoSync: config.autoSync },
       log: (level: 'info' | 'warn', message: string) => managed.logger?.[level]?.(message),
+      seed: config.seed?.trim() || process.env.BKMS_PLUGIN_CENTER_SEED?.trim() || undefined,
     })
     // 官方安装器的日志与阶段事件，按 requestId 归到对应插件的进度上。
     managed.on('plugin-manager/install-log', (chunk: any) => instance.installLog(chunk))
