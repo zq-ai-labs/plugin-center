@@ -131,9 +131,8 @@ export function createSync({ manager, home, stateDir, profileDir, preset = {}, f
   const configFile = join(root, 'config.json');
   const cacheDir = join(root, 'packages');
   const stateFile = join(stateDir, 'sync-state.json');
-  // 上次成功读到的中心规则与目录：中心暂时读不到时继续按它维护插件、展示应用。
+  // 上次成功读到的中心规则：中心暂时读不到时继续按它维护插件。
   const policyFile = join(stateDir, 'policy.json');
-  const catalogFile = join(stateDir, 'catalog.json');
   let state = { revision: null, lastCheck: null, lastError: '', plugins: {}, history: [], ...readJson(stateFile, {}) };
   let policy = null, etag = null, policyCenter = null, policySource = null;
   let seedPolicy = null, seedError = '', seeded = false;
@@ -395,24 +394,6 @@ export function createSync({ manager, home, stateDir, profileDir, preset = {}, f
       const entry = state.plugins[name];
       if (entry) { entry.failures = 0; entry.pausedRevision = null; entry.lastError = ''; save(); }
       return this.checkNow();
-    },
-    /**
-     * 中心目录（应用中心用来展示应用）。中心读不到时依次用上次读到的目录、离线种子里的 plugins.json，
-     * 保证断网首次启动时也能看到正在安装的应用；都没有时抛出中心的错误。
-     */
-    async catalog() {
-      const { address } = config();
-      try {
-        const result = await readCatalog(address);
-        try { writeJson(catalogFile, result); } catch { /* 目录缓存只为离线时使用 */ }
-        return result;
-      } catch (error) {
-        const cached = readJson(catalogFile, null);
-        if (cached?.center === address && Array.isArray(cached.plugins)) return { ...cached, source: 'cache' };
-        const seeded = seed ? readJson(join(seed, 'plugins.json'), null) : null;
-        if (Array.isArray(seeded?.plugins)) return { center: address, plugins: seeded.plugins, source: 'seed' };
-        throw error;
-      }
     },
     getConfig: config,
     setConfig(input) {
